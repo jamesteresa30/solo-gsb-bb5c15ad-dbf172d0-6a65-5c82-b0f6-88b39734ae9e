@@ -6,6 +6,8 @@
 
 完整条件序列仅保存在服务端，通过推进接口按周期受控揭盲：
 创建与详情接口只返回受试者名册，不暴露任何后续周期安排。
+创建实验时另为每个稳定分配槽位 / 周期生成 128 位 nonce 与 SHA-256 盲态承诺；
+承诺列表不提前泄露条件或 nonce，成功推进时才返回对应 nonce 供审计核验。
 另提供双人审批（15 分钟授权窗口）的实验级紧急揭盲通道，
 审批与最终揭盲在单个 SQLite 写事务内完成，审计记录不含条件内容。
 另提供脱敏结果快照：在单个一致性读事务内固定同一时点，按 subject_id
@@ -31,6 +33,7 @@ from .schemas import (
     AdvanceBatchRequest,
     AdvanceOut,
     AdvanceRequest,
+    CommitmentsOut,
     CompleteOut,
     CompleteRequest,
     EmergencyUnblindEventsOut,
@@ -65,7 +68,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -213,9 +216,31 @@ def get_experiment(experiment_id: str) -> dict:
     return experiment
 
 
+@app.get(
+    "/experiments/{experiment_id}/commitments",
+    response_model=CommitmentsOut,
+    summary="查询盲态分配承诺（只返回槽位、周期与承诺，不返回 nonce 或条件）",
+)
+def list_commitments(experiment_id: str) -> dict:
+    try:
+        commitments = db.list_commitments(experiment_id)
+    except db.CommitmentsUnavailableError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该实验创建时尚未启用盲态承诺，不能事后补造",
+                "reason": "commitments_unavailable",
+            },
+        )
+    if commitments is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return {"experiment_id": experiment_id, "commitments": commitments}
+
+
 @app.post(
     "/experiments/{experiment_id}/advance",
     response_model=AdvanceOut,
+    response_model_exclude_none=True,
     summary=(
         "按周期受控揭盲：上一周期已完成且洗脱期届满时，"
         "仅当 expected_period 为下一周期才返回当前条件并原子推进"
@@ -307,6 +332,7 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
 @app.post(
     "/experiments/{experiment_id}/advance-batch",
     response_model=AdvanceBatchOut,
+    response_model_exclude_none=True,
     summary=(
         "批量受控揭盲：单个写事务内校验全部成员的完成登记与洗脱期门禁，"
         "全部通过才按输入顺序揭盲并推进；任一项失败整批零写入并返回 409"

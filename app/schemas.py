@@ -60,6 +60,20 @@ class ExperimentSummary(BaseModel):
     created_at: str
 
 
+class CommitmentOut(BaseModel):
+    """单个稳定分配槽位 / 周期的盲态承诺。"""
+
+    subject_id: str
+    allocation_slot_id: str
+    period: int
+    commitment: str
+
+
+class CommitmentsOut(BaseModel):
+    experiment_id: str
+    commitments: list[CommitmentOut]
+
+
 class AdvanceRequest(BaseModel):
     """按周期受控揭盲的推进请求。"""
 
@@ -81,6 +95,9 @@ class AdvanceOut(BaseModel):
     condition: str
     request_id: str
     revealed_at: str
+    # 新实验在揭盲成功时返回对应稳定槽位与 nonce；旧实验无创建时承诺，不返回。
+    allocation_slot_id: str | None = None
+    nonce: str | None = None
 
 
 class AdvanceBatchMember(BaseModel):

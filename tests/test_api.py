@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import sqlite3
 import threading
 from collections import Counter
@@ -302,6 +305,223 @@ def test_get_experiment_does_not_leak_sequence(client: TestClient) -> None:
 
 def test_get_unknown_experiment_returns_404(client: TestClient) -> None:
     assert client.get("/experiments/nope").status_code == 404
+
+
+# ---------- 盲态分配承诺 ----------
+
+def commitment_digest(
+    experiment_id: str,
+    allocation_slot_id: str,
+    period: int,
+    condition: str,
+    nonce: str,
+) -> str:
+    payload = [experiment_id, allocation_slot_id, period, condition, nonce]
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def test_commitments_list_hides_conditions_and_unrevealed_nonces(
+    client: TestClient,
+) -> None:
+    body, subject_ids = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+
+    resp = client.get(f"/experiments/{eid}/commitments")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["experiment_id"] == eid
+    commitments = payload["commitments"]
+    assert len(commitments) == 4
+    assert [
+        (item["subject_id"], item["period"]) for item in commitments
+    ] == [("s1", 1), ("s1", 2), ("s2", 1), ("s2", 2)]
+    for item in commitments:
+        assert set(item) == {
+            "subject_id",
+            "allocation_slot_id",
+            "period",
+            "commitment",
+        }
+        assert re.fullmatch(r"[0-9a-f]{32}", item["allocation_slot_id"])
+        assert re.fullmatch(r"[0-9a-f]{64}", item["commitment"])
+    slots = {item["allocation_slot_id"] for item in commitments}
+    assert len(slots) == len(subject_ids)
+    assert "nonce" not in resp.text
+    assert '"condition"' not in resp.text
+
+
+def test_advance_returns_nonce_that_verifies_creation_time_commitment(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client,
+        conditions=["条件甲", "条件乙"],
+        subject_ids=["受试者一", "受试者二"],
+        seed=11,
+    )
+    eid = body["experiment_id"]
+    commitments = client.get(
+        f"/experiments/{eid}/commitments"
+    ).json()["commitments"]
+    by_key = {
+        (item["subject_id"], item["period"]): item for item in commitments
+    }
+
+    advance_payload = {
+        "subject_id": "受试者一",
+        "expected_period": 1,
+        "request_id": "reveal-1",
+    }
+    first = client.post(f"/experiments/{eid}/advance", json=advance_payload)
+    assert first.status_code == 200
+    revealed = first.json()
+    assert revealed["allocation_slot_id"] == by_key[("受试者一", 1)][
+        "allocation_slot_id"
+    ]
+    assert re.fullmatch(r"[0-9a-f]{32}", revealed["nonce"])
+    expected_commitment = by_key[("受试者一", 1)]["commitment"]
+    assert (
+        commitment_digest(
+            eid,
+            revealed["allocation_slot_id"],
+            1,
+            revealed["condition"],
+            revealed["nonce"],
+        )
+        == expected_commitment
+    )
+
+    # 未揭盲的周期 2 仍不能通过任何推进响应取得 nonce
+    blocked = client.post(
+        f"/experiments/{eid}/advance",
+        json={
+            "subject_id": "受试者一",
+            "expected_period": 2,
+            "request_id": "reveal-2",
+        },
+    )
+    assert blocked.status_code == 409
+    assert "nonce" not in blocked.text
+
+    # 幂等重放返回同一个槽位与 nonce
+    replay = client.post(f"/experiments/{eid}/advance", json=advance_payload)
+    assert replay.status_code == 200
+    assert replay.json() == revealed
+
+
+def test_batch_advance_and_replay_return_commitment_nonces(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid = body["experiment_id"]
+    commitments = {
+        (item["subject_id"], item["period"]): item
+        for item in client.get(f"/experiments/{eid}/commitments").json()[
+            "commitments"
+        ]
+    }
+    members = [
+        {"subject_id": "s2", "expected_period": 1},
+        {"subject_id": "s1", "expected_period": 1},
+    ]
+
+    first = client.post(
+        f"/experiments/{eid}/advance-batch",
+        json={"batch_id": "batch-commitment", "members": members},
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    for result in first_body["results"]:
+        key = (result["subject_id"], result["period"])
+        assert result["allocation_slot_id"] == commitments[key]["allocation_slot_id"]
+        assert re.fullmatch(r"[0-9a-f]{32}", result["nonce"])
+        assert (
+            commitment_digest(
+                eid,
+                result["allocation_slot_id"],
+                result["period"],
+                result["condition"],
+                result["nonce"],
+            )
+            == commitments[key]["commitment"]
+        )
+
+    replay = client.post(
+        f"/experiments/{eid}/advance-batch",
+        json={"batch_id": "batch-commitment", "members": members},
+    )
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+
+
+def test_replacement_moves_slot_ownership_without_recomputing_commitments(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=2
+    )
+    eid = body["experiment_id"]
+    before = client.get(f"/experiments/{eid}/commitments").json()["commitments"]
+    original = [item for item in before if item["subject_id"] == "s1"]
+
+    replaced = client.post(
+        f"/experiments/{eid}/subjects/s1/replace",
+        json={
+            "replacement_subject_id": "s1-new",
+            "operation_id": "rep-commitment",
+            "reason": "编号录入错误",
+        },
+    )
+    assert replaced.status_code == 200
+
+    after = client.get(f"/experiments/{eid}/commitments").json()["commitments"]
+    moved = [item for item in after if item["subject_id"] == "s1-new"]
+    assert moved == [
+        {
+            **item,
+            "subject_id": "s1-new",
+        }
+        for item in original
+    ]
+    assert not [item for item in after if item["subject_id"] == "s1"]
+
+    revealed = client.post(
+        f"/experiments/{eid}/advance",
+        json={
+            "subject_id": "s1-new",
+            "expected_period": 1,
+            "request_id": "new-slot-reveal",
+        },
+    )
+    assert revealed.status_code == 200
+    body_revealed = revealed.json()
+    assert body_revealed["allocation_slot_id"] == moved[0]["allocation_slot_id"]
+    assert (
+        commitment_digest(
+            eid,
+            body_revealed["allocation_slot_id"],
+            1,
+            body_revealed["condition"],
+            body_revealed["nonce"],
+        )
+        == moved[0]["commitment"]
+    )
+
+    # 原编号仍遵守墓碑语义，且不能查询其已迁移走的承诺归属
+    assert client.get(
+        f"/experiments/{eid}/subjects/s1/progress"
+    ).status_code == 409
+
+
+def test_commitments_unknown_experiment_returns_404(client: TestClient) -> None:
+    assert client.get("/experiments/missing/commitments").status_code == 404
 
 
 # ---------- 按周期受控揭盲 ----------
@@ -1453,6 +1673,10 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         assert progress["next_available_at"] is None
         assert progress["reveals"] == []
 
+        commitments = migrated.get("/experiments/legacy-1/commitments")
+        assert commitments.status_code == 409
+        assert commitments.json()["detail"]["reason"] == "commitments_unavailable"
+
         resp = migrated.post(
             "/experiments/legacy-1/advance",
             json={
@@ -1463,6 +1687,8 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         )
         assert resp.status_code == 200
         assert resp.json()["condition"] == "A"
+        assert "nonce" not in resp.json()
+        assert "allocation_slot_id" not in resp.json()
 
         # 未完成上一周期不能推进；旧实验 washout=0，完成后立即放行
         blocked = migrated.post(

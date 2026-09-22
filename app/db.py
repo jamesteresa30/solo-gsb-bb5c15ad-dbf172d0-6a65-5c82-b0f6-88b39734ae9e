@@ -38,6 +38,11 @@
   （仅已揭盲周期与完成时间，按 ``subject_id`` 稳定排序，绝不包含
   ``sequence_index`` 或未揭盲安排）及其规范化 JSON 的 SHA-256 摘要；
   快照只增不改，可按快照 ID 随时取回同一份内容。
+* ``allocation_commitments``：创建实验时为每个稳定分配槽位 / 周期生成
+  128 位随机 nonce 与 SHA-256 盲态承诺。承诺输入为键排序、紧凑 UTF-8 JSON
+  数组 ``[experiment_id, allocation_slot_id, period, condition, nonce]``；
+  查询接口只返回当前归属受试者、槽位、周期与承诺，未揭盲项不返回 nonce。
+  换号只迁移槽位归属，不重算承诺；旧实验没有承诺，拒绝事后补造。
 * ``subject_replacements``：受试者换号的墓碑与追加式审计（合一张表）。
   每行记录一次成功换号：原编号（``original_subject_id``，即退役墓碑）、
   新编号（``replacement_subject_id``）、``operation_id`` 与原因，
@@ -54,6 +59,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import sqlite3
 import uuid
 from contextlib import closing
@@ -215,6 +221,17 @@ CREATE TABLE IF NOT EXISTS subject_replacements (
     UNIQUE (experiment_id, operation_id),
     UNIQUE (experiment_id, original_subject_id)
 );
+
+CREATE TABLE IF NOT EXISTS allocation_commitments (
+    experiment_id       TEXT NOT NULL REFERENCES experiments(id),
+    allocation_slot_id  TEXT NOT NULL,       -- 创建时固定的稳定槽位 ID
+    period              INTEGER NOT NULL,
+    subject_id          TEXT NOT NULL,       -- 当前归属；换号只迁移该归属
+    condition           TEXT NOT NULL,       -- 创建时安排的条件（服务端持有）
+    nonce               TEXT NOT NULL,       -- 128 位随机 nonce（32 位 hex）
+    commitment          TEXT NOT NULL,       -- 规范化承诺 JSON 的 SHA-256 hex
+    PRIMARY KEY (experiment_id, allocation_slot_id, period)
+);
 """
 
 
@@ -344,6 +361,10 @@ class SnapshotOperationIdConflictError(Exception):
     """
 
 
+class CommitmentsUnavailableError(Exception):
+    """旧实验没有创建时生成的盲态承诺，且不允许事后补造。"""
+
+
 class SubjectReplacedError(Exception):
     """受试者编号已退役（换号墓碑）：不能复用、查询进度或推进。
 
@@ -422,7 +443,8 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 def init_db() -> None:
     """建表 / 迁移（幂等），在应用启动时调用。
 
-    * 新增表通过 ``CREATE TABLE IF NOT EXISTS`` 补齐；
+    * 新增表通过 ``CREATE TABLE IF NOT EXISTS`` 补齐；盲态承诺等新模块只建表，
+      不为旧实验回填创建时数据；
     * 旧库的 ``experiments`` 表缺少 ``washout_seconds`` 列时以
       ``ALTER TABLE ... DEFAULT 0`` 补齐，旧实验按 0 秒洗脱期处理；
     * 旧库缺少 ``status`` / ``state_version`` 列时分别以
@@ -447,6 +469,27 @@ def init_db() -> None:
                     "ALTER TABLE experiments "
                     "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
                 )
+
+
+def _commitment_digest(
+    experiment_id: str,
+    allocation_slot_id: str,
+    period: int,
+    condition: str,
+    nonce: str,
+) -> str:
+    """计算盲态承诺：数组按规范 JSON 编码后取 SHA-256。"""
+    payload = [
+        experiment_id,
+        allocation_slot_id,
+        period,
+        condition,
+        nonce,
+    ]
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def insert_experiment(
@@ -475,19 +518,47 @@ def insert_experiment(
                     created_at,
                 ),
             )
+            assignment_rows = []
+            commitment_rows = []
+            for assignment in assignments:
+                slot_id = assignment.get(
+                    "allocation_slot_id", uuid.uuid4().hex
+                )
+                assignment_rows.append(
+                    (
+                        experiment_id,
+                        assignment["subject_id"],
+                        assignment["sequence_index"],
+                        json.dumps(assignment["sequence"], ensure_ascii=False),
+                    )
+                )
+                for period, condition in enumerate(assignment["sequence"], start=1):
+                    nonce = secrets.token_hex(16)  # 128 位随机 nonce
+                    commitment_rows.append(
+                        (
+                            experiment_id,
+                            slot_id,
+                            period,
+                            assignment["subject_id"],
+                            condition,
+                            nonce,
+                            _commitment_digest(
+                                experiment_id, slot_id, period, condition, nonce
+                            ),
+                        )
+                    )
             conn.executemany(
                 "INSERT INTO assignments "
                 "(experiment_id, subject_id, sequence_index, sequence) "
                 "VALUES (?, ?, ?, ?)",
-                [
-                    (
-                        experiment_id,
-                        a["subject_id"],
-                        a["sequence_index"],
-                        json.dumps(a["sequence"], ensure_ascii=False),
-                    )
-                    for a in assignments
-                ],
+                assignment_rows,
+            )
+            conn.executemany(
+                "INSERT INTO allocation_commitments "
+                "(experiment_id, allocation_slot_id, period, subject_id, "
+                "condition, nonce, commitment) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                commitment_rows,
             )
 
 
@@ -513,7 +584,9 @@ def advance_period(
        :class:`WashoutNotElapsedError`（携带 retry_after_seconds）。
        门禁失败只返回“需要等待”，不揭露下一周期条件；
     4. 揭盲：写入 ``unblindings``、推进 ``subject_progress``、
-       落盘 ``advance_requests``，三者一起提交或一起回滚。
+       落盘 ``advance_requests``，三者一起提交或一起回滚；
+    5. 新实验还在响应中返回该槽位 / 周期创建时保存的 ``allocation_slot_id``
+       与 ``nonce``；旧实验无承诺，故不返回这两个字段。
 
     服务端时间在事务内读取，保证并发完成 / 推进下判断与写入原子一致。
     返回首次 / 重放的揭盲结果；实验或受试者不存在时返回 ``None``。
@@ -584,6 +657,26 @@ def _is_tombstoned(
     return row is not None
 
 
+def _get_commitment_for_reveal(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    subject_id: str,
+    period: int,
+) -> dict[str, str] | None:
+    """读取已到揭盲时刻的槽位承诺 secret；旧实验没有承诺时返回 None。"""
+    row = conn.execute(
+        "SELECT allocation_slot_id, nonce FROM allocation_commitments "
+        "WHERE experiment_id = ? AND subject_id = ? AND period = ?",
+        (experiment_id, subject_id, period),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "allocation_slot_id": row["allocation_slot_id"],
+        "nonce": row["nonce"],
+    }
+
+
 def _advance_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -593,8 +686,14 @@ def _advance_locked(
 ) -> dict[str, Any] | None:
     # 1) 幂等命中：返回首次结果，绝不重复推进
     request_row = conn.execute(
-        "SELECT subject_id, expected_period, period, condition, revealed_at "
-        "FROM advance_requests WHERE experiment_id = ? AND request_id = ?",
+        "SELECT ar.subject_id, ar.expected_period, ar.period, ar.condition, "
+        "ar.revealed_at, ac.allocation_slot_id, ac.nonce "
+        "FROM advance_requests ar "
+        "LEFT JOIN allocation_commitments ac "
+        "ON ac.experiment_id = ar.experiment_id "
+        "AND ac.subject_id = ar.subject_id "
+        "AND ac.period = ar.period "
+        "WHERE ar.experiment_id = ? AND ar.request_id = ?",
         (experiment_id, request_id),
     ).fetchone()
     if request_row is not None:
@@ -603,7 +702,7 @@ def _advance_locked(
             or request_row["expected_period"] != expected_period
         ):
             raise RequestIdConflictError()
-        return {
+        result = {
             "experiment_id": experiment_id,
             "subject_id": subject_id,
             "period": request_row["period"],
@@ -612,6 +711,10 @@ def _advance_locked(
             "revealed_at": request_row["revealed_at"],
             "_replayed": True,
         }
+        if request_row["allocation_slot_id"] is not None:
+            result["allocation_slot_id"] = request_row["allocation_slot_id"]
+            result["nonce"] = request_row["nonce"]
+        return result
 
     # 2) 实验必须存在（决定洗脱期 / 暂停状态），受试者序列必须存在（均不做下发）
     meta = _get_experiment_meta(conn, experiment_id)
@@ -672,6 +775,9 @@ def _advance_locked(
         revealed_at = utc_now().isoformat()
 
     condition = sequence[next_period - 1]
+    commitment_secret = _get_commitment_for_reveal(
+        conn, experiment_id, subject_id, next_period
+    )
 
     conn.execute(
         "INSERT INTO unblindings "
@@ -710,7 +816,7 @@ def _advance_locked(
         ),
     )
 
-    return {
+    result = {
         "experiment_id": experiment_id,
         "subject_id": subject_id,
         "period": next_period,
@@ -719,6 +825,9 @@ def _advance_locked(
         "revealed_at": revealed_at,
         "_replayed": False,
     }
+    if commitment_secret is not None:
+        result.update(commitment_secret)
+    return result
 
 
 def advance_batch(
@@ -740,7 +849,7 @@ def advance_batch(
        :class:`BatchMembersRejectedError`，**整批回滚、零写入**；
     3. 揭盲：仅当全部成员通过后，才**按输入顺序**写入每条揭盲记录、
        推进 ``subject_progress``，最后落盘 ``advance_batches`` 幂等结果，
-       一起提交或一起回滚。
+       一起提交或一起回滚；新实验的每条结果附加稳定槽位 ID 与 nonce。
 
     失败项只携带 ``subject_id`` 与原因（及安全的 ``next_period`` /
     ``retry_after_seconds``），不附带任何条件。实验不存在时返回 ``None``。
@@ -767,6 +876,23 @@ def advance_batch(
         conn.close()
 
 
+def _attach_commitment_secrets(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    results: list[dict[str, Any]],
+) -> None:
+    """为已揭盲结果附加槽位 ID 与 nonce；旧实验无承诺时保持原样。"""
+    for result in results:
+        secret = _get_commitment_for_reveal(
+            conn,
+            experiment_id,
+            result["subject_id"],
+            result["period"],
+        )
+        if secret is not None:
+            result.update(secret)
+
+
 def _advance_batch_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -790,10 +916,12 @@ def _advance_batch_locked(
         ]
         if bound_members != request_members:
             raise BatchIdConflictError()
+        replay_results = json.loads(batch_row["results"])
+        _attach_commitment_secrets(conn, experiment_id, replay_results)
         return {
             "experiment_id": experiment_id,
             "batch_id": batch_id,
-            "results": json.loads(batch_row["results"]),
+            "results": replay_results,
             "_replayed": True,
         }
 
@@ -964,6 +1092,8 @@ def _advance_batch_locked(
                 "revealed_at": revealed_at,
             }
         )
+
+    _attach_commitment_secrets(conn, experiment_id, results)
 
     conn.execute(
         "INSERT INTO advance_batches "
@@ -2185,6 +2315,12 @@ def _replace_subject_locked(
         "WHERE experiment_id = ? AND subject_id = ?",
         (replacement_subject_id, experiment_id, subject_id),
     )
+    # 换号只迁移槽位归属；commitment / nonce 均保持创建时的值
+    conn.execute(
+        "UPDATE allocation_commitments SET subject_id = ? "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (replacement_subject_id, experiment_id, subject_id),
+    )
 
     # 7) 同事务落墓碑与审计（同一张表）：原编号自此退役
     created_at = utc_now().isoformat()
@@ -2277,6 +2413,38 @@ def list_state_events(
             (experiment_id, limit, offset),
         ).fetchall()
     return [_state_event_dict(row) for row in rows]
+
+
+def list_commitments(experiment_id: str) -> list[dict[str, Any]] | None:
+    """返回当前槽位归属的盲态承诺；绝不返回 condition 或 nonce。
+
+    实验不存在返回 ``None``；实验存在但没有任何创建时承诺（旧实验）抛出
+    :class:`CommitmentsUnavailableError`，避免把迁移后补造的值伪装成创建时承诺。
+    换号只改变 ``subject_id`` 归属，因此这里自然返回新编号与原承诺。
+    """
+    with closing(get_connection()) as conn:
+        experiment_row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if experiment_row is None:
+            return None
+        rows = conn.execute(
+            "SELECT subject_id, allocation_slot_id, period, commitment "
+            "FROM allocation_commitments "
+            "WHERE experiment_id = ? ORDER BY subject_id, period",
+            (experiment_id,),
+        ).fetchall()
+        if not rows:
+            raise CommitmentsUnavailableError()
+    return [
+        {
+            "subject_id": row["subject_id"],
+            "allocation_slot_id": row["allocation_slot_id"],
+            "period": row["period"],
+            "commitment": row["commitment"],
+        }
+        for row in rows
+    ]
 
 
 def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:

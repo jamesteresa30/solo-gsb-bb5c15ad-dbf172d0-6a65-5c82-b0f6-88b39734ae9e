@@ -34,6 +34,58 @@
 - 进度查询只返回**已揭盲记录（含各自的 `completed_at`）**、`next_period` 与
   `next_available_at`（下一周期最早可推进时间），不暴露后续周期安排。
 
+## 盲态分配承诺（blind allocation commitments）
+
+为让审计方在不提前获知条件的情况下验证“每次揭盲确为创建实验时已经确定的安排”，
+创建实验时服务会为每个**稳定分配槽位**的每个周期生成一个 128 位随机 `nonce`
+（以 32 位小写 hex 表示），并计算：
+
+```text
+SHA-256(canonical_json([experiment_id, allocation_slot_id, period, condition, nonce]))
+```
+
+其中 `canonical_json` 为紧凑分隔符、键排序、UTF-8 编码的 JSON
+（`json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"))`，
+数组本身顺序固定，不参与对象键排序）。
+
+- `GET /experiments/{id}/commitments` 返回当前受试者编号、稳定槽位 ID、周期与
+  commitment；不返回条件，也不返回任何未揭盲周期的 nonce；
+- 单条推进与批量推进成功时，响应中的每条揭盲结果额外返回
+  `allocation_slot_id` 与 `nonce`；相同 `request_id` / `batch_id` 的幂等重放
+  也返回首次结果对应的槽位与 nonce；
+- 揭盲失败、暂停、周期不匹配或查询承诺列表时均不会泄露未揭盲 nonce；
+- 受试者换号只把槽位归属从旧编号迁移到新编号，**不重算 commitment / nonce**；
+  原编号仍按墓碑语义不可查询、推进或揭盲；
+- 数据库迁移只新增承诺表，不回填旧实验。旧实验没有创建时承诺，调用承诺接口返回
+  `409 commitments_unavailable`，避免迁移后伪造“创建时承诺”。
+
+### 本地校验示例
+
+```bash
+python - <<'PY'
+import hashlib
+import json
+
+experiment_id = "把这里替换为实验 ID"
+allocation_slot_id = "推进响应中的 allocation_slot_id"
+period = 1
+condition = "推进响应中的 condition"
+nonce = "推进响应中的 nonce"
+commitment_from_api = "GET /commitments 中对应 subject_id / period 的 commitment"
+
+payload = [experiment_id, allocation_slot_id, period, condition, nonce]
+canonical = json.dumps(
+    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+)
+digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+print(canonical)
+print(digest)
+assert digest == commitment_from_api
+print("commitment verified")
+PY
+```
+
 ## 实验级暂停 / 恢复（pause / resume）
 
 管理员可在不删除实验的情况下整体冻结揭盲流程：
@@ -153,11 +205,12 @@ docker compose up --build
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
 启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换、
-紧急揭盲幂等、紧急揭盲审计、结果快照与受试者换号表通过 `CREATE TABLE IF NOT EXISTS`
-自动补齐，
+紧急揭盲幂等、紧急揭盲审计、结果快照、受试者换号与盲态分配承诺表通过
+`CREATE TABLE IF NOT EXISTS` 自动补齐；
 `experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
 `ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
 状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停与恢复、紧急揭盲。
+盲态承诺不会为旧实验回填；旧实验查询承诺时返回 `409 commitments_unavailable`。
 
 - **访问地址**：http://localhost:8000
 - **交互式 API 文档（Swagger UI）**：http://localhost:8000/docs
@@ -258,6 +311,39 @@ curl -X POST http://localhost:8000/experiments \
 }
 ```
 
+### 查询盲态承诺 `GET /experiments/{experiment_id}/commitments`
+
+```bash
+curl http://localhost:8000/experiments/<experiment_id>/commitments
+```
+
+返回每个当前受试者 / 稳定槽位 / 周期的承诺，不包含条件或 nonce：
+
+```json
+{
+  "experiment_id": "…",
+  "commitments": [
+    {
+      "subject_id": "s1",
+      "allocation_slot_id": "…",
+      "period": 1,
+      "commitment": "64 位小写 SHA-256 hex"
+    }
+  ]
+}
+```
+
+旧实验没有创建时承诺，返回：
+
+```json
+{
+  "detail": {
+    "message": "该实验创建时尚未启用盲态承诺，不能事后补造",
+    "reason": "commitments_unavailable"
+  }
+}
+```
+
 ### 推进揭盲 `POST /experiments/{experiment_id}/advance`
 
 进入下一周期前调用，请求体：
@@ -284,7 +370,9 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance \
   "period": 1,
   "condition": "A",
   "request_id": "9f1c…",
-  "revealed_at": "2026-09-21T08:00:00.000000+00:00"
+  "revealed_at": "2026-09-21T08:00:00.000000+00:00",
+  "allocation_slot_id": "…",
+  "nonce": "32 位小写 128 位随机值 hex"
 }
 ```
 
@@ -363,9 +451,11 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance-batch \
   "batch_id": "b7c1…",
   "results": [
     {"experiment_id": "…", "subject_id": "s1", "period": 1, "condition": "A",
-     "request_id": "batch:b7c1…:s1:1", "revealed_at": "…"},
+     "request_id": "batch:b7c1…:s1:1", "revealed_at": "…",
+     "allocation_slot_id": "…", "nonce": "…"},
     {"experiment_id": "…", "subject_id": "s2", "period": 1, "condition": "B",
-     "request_id": "batch:b7c1…:s2:1", "revealed_at": "…"}
+     "request_id": "batch:b7c1…:s2:1", "revealed_at": "…",
+     "allocation_slot_id": "…", "nonce": "…"}
   ]
 }
 ```
