@@ -14,11 +14,17 @@
 另提供受试者换号：仅允许原受试者从未揭盲时，在单个写事务内把隐藏分配
 （序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑不可复用、
 不可查询或推进，并追加不含条件内容的换号审计（按时间倒序分页查询）。
+另提供盲态分配承诺：创建实验时为每个稳定分配槽位 / 周期生成 ≥128 位
+随机 nonce 并落盘 SHA-256 承诺；审计方在揭盲前只能看到承诺，揭盲成功
+（含幂等重放）后才拿到该槽位 / 周期的 nonce，可重算哈希验证揭盲确为
+创建时确定的安排。换号只迁移槽位归属、不重算承诺；旧实验无创建时
+承诺，承诺接口返回 409 commitments_unavailable。
 """
 
 from __future__ import annotations
 
 import random
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -31,6 +37,7 @@ from .schemas import (
     AdvanceBatchRequest,
     AdvanceOut,
     AdvanceRequest,
+    CommitmentsOut,
     CompleteOut,
     CompleteRequest,
     EmergencyUnblindEventsOut,
@@ -65,7 +72,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -167,6 +174,32 @@ def create_experiment(payload: ExperimentCreate) -> dict:
 
     experiment_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
+
+    # 盲态分配承诺：每个稳定分配槽位一个创建时生成的随机槽位 ID（换号不变），
+    # 槽位内每个周期生成 ≥128 位随机 nonce 并计算承诺哈希。
+    # nonce 不取自种子 RNG——种子是公开输入，承诺必须无法由创建参数预测。
+    commitments: list[dict] = []
+    for assignment in assignments:
+        allocation_slot_id = uuid.uuid4().hex
+        for period, condition in enumerate(assignment["sequence"], start=1):
+            nonce = secrets.token_hex(db.COMMITMENT_NONCE_BYTES)
+            commitments.append(
+                {
+                    "allocation_slot_id": allocation_slot_id,
+                    "subject_id": assignment["subject_id"],
+                    "period": period,
+                    "condition": condition,
+                    "nonce": nonce,
+                    "commitment": db.compute_commitment(
+                        experiment_id,
+                        allocation_slot_id,
+                        period,
+                        condition,
+                        nonce,
+                    ),
+                }
+            )
+
     db.insert_experiment(
         experiment_id,
         conditions,
@@ -175,6 +208,7 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         created_at,
         assignments,
         washout_seconds=payload.washout_seconds,
+        commitments=commitments,
     )
 
     return {
@@ -211,6 +245,34 @@ def get_experiment(experiment_id: str) -> dict:
     if experiment is None:
         raise HTTPException(status_code=404, detail="experiment not found")
     return experiment
+
+
+@app.get(
+    "/experiments/{experiment_id}/commitments",
+    response_model=CommitmentsOut,
+    summary=(
+        "查询盲态分配承诺：只返回当前受试者、稳定槽位、周期与承诺哈希，"
+        "不返回 nonce；旧实验无创建时承诺时返回 409 commitments_unavailable"
+    ),
+)
+def list_commitments(experiment_id: str) -> dict:
+    commitments = db.get_commitments(experiment_id)
+    if commitments is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    if not commitments:
+        # 承诺机制上线前创建的旧实验没有创建时承诺；迁移只建表、不回填，
+        # 绝不事后伪造创建时承诺
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "该实验创建于分配承诺机制上线前，不存在创建时承诺"
+                ),
+                "reason": "commitments_unavailable",
+                "experiment_id": experiment_id,
+            },
+        )
+    return {"experiment_id": experiment_id, "commitments": commitments}
 
 
 @app.post(

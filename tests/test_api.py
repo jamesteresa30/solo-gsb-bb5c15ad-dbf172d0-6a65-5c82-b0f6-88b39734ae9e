@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import sqlite3
 import threading
 from collections import Counter
@@ -4256,3 +4259,412 @@ def test_legacy_database_supports_subject_replacement_after_migration(
         ).json()
         assert len(events["replacements"]) == 1
         assert_no_sequence_leak(events)
+
+
+# ---------- 盲态分配承诺（allocation commitments） ----------
+
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def get_commitments(client: TestClient, experiment_id: str):
+    return client.get(f"/experiments/{experiment_id}/commitments")
+
+
+def recompute_commitment(
+    experiment_id: str,
+    allocation_slot_id: str,
+    period: int,
+    condition: str,
+    nonce: str,
+) -> str:
+    """按服务端同一规则重算承诺：键排序、紧凑 UTF-8 JSON 的 SHA-256。"""
+    payload = {
+        "experiment_id": experiment_id,
+        "allocation_slot_id": allocation_slot_id,
+        "period": period,
+        "condition": condition,
+        "nonce": nonce,
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def test_commitments_listed_for_every_slot_and_period(client: TestClient) -> None:
+    body, subject_ids = create_experiment(
+        client, conditions=["A", "B", "C"], subject_ids=[f"s{i}" for i in range(6)]
+    )
+    eid = body["experiment_id"]
+
+    resp = get_commitments(client, eid)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["experiment_id"] == eid
+
+    # 每个稳定分配槽位 × 每个周期一条承诺：6 受试者 × 3 周期
+    commitments = data["commitments"]
+    assert len(commitments) == 6 * 3
+
+    for entry in commitments:
+        # 仅返回当前受试者、槽位、周期与承诺，绝不带 nonce / 条件
+        assert set(entry.keys()) == {
+            "subject_id",
+            "allocation_slot_id",
+            "period",
+            "commitment",
+        }
+        assert entry["subject_id"] in subject_ids
+        assert entry["period"] in (1, 2, 3)
+        assert HEX64.match(entry["commitment"])
+
+    # 每个受试者对应唯一稳定槽位
+    slots_by_subject: dict[str, set[str]] = {}
+    for entry in commitments:
+        slots_by_subject.setdefault(entry["subject_id"], set()).add(
+            entry["allocation_slot_id"]
+        )
+    assert all(len(slots) == 1 for slots in slots_by_subject.values())
+    # 不同受试者的槽位互不相同
+    all_slots = {next(iter(slots)) for slots in slots_by_subject.values()}
+    assert len(all_slots) == 6
+
+    # 按 subject_id、period 稳定排序
+    ordered = [
+        (entry["subject_id"], entry["period"]) for entry in commitments
+    ]
+    assert ordered == sorted(ordered)
+
+
+def test_nonce_is_random_not_derived_from_seed(client: TestClient) -> None:
+    payload = {
+        "conditions": ["A", "B"],
+        "subject_ids": ["s1", "s2"],
+        "seed": 7,
+    }
+    first = client.post("/experiments", json=payload).json()
+    second = client.post("/experiments", json=payload).json()
+
+    first_commitments = get_commitments(client, first["experiment_id"]).json()[
+        "commitments"
+    ]
+    second_commitments = get_commitments(client, second["experiment_id"]).json()[
+        "commitments"
+    ]
+    # 分配（由种子决定）相同，但承诺包含随机 nonce：两次创建必然不同
+    first_hashes = {c["commitment"] for c in first_commitments}
+    second_hashes = {c["commitment"] for c in second_commitments}
+    assert first_hashes.isdisjoint(second_hashes)
+
+
+def test_advance_reveals_nonce_and_slot_verifiable_against_commitment(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B", "C"], subject_ids=[f"s{i}" for i in range(6)]
+    )
+    eid = body["experiment_id"]
+
+    resp = reveal_period(client, eid, "s0", 1)
+    assert resp.status_code == 200
+    result = resp.json()
+    slot_id = result["allocation_slot_id"]
+    nonce = result["nonce"]
+    # nonce 至少 128 位（32 位 hex）
+    assert isinstance(slot_id, str) and slot_id
+    assert HEX32.match(nonce)
+
+    # 用揭盲返回的 nonce / 槽位 / 条件重算承诺，应与创建时承诺一致
+    expected = recompute_commitment(
+        eid, slot_id, result["period"], result["condition"], nonce
+    )
+    commitments = {
+        (c["allocation_slot_id"], c["period"]): c["commitment"]
+        for c in get_commitments(client, eid).json()["commitments"]
+    }
+    assert expected == commitments[(slot_id, 1)]
+
+    # 幂等重放：仍返回同一槽位与 nonce（未揭盲周期不受影响）
+    replay = client.post(
+        f"/experiments/{eid}/advance",
+        json={
+            "subject_id": "s0",
+            "expected_period": 1,
+            "request_id": f"s0-p1",
+        },
+    )
+    assert replay.status_code == 200
+    replayed = replay.json()
+    assert replayed["allocation_slot_id"] == slot_id
+    assert replayed["nonce"] == nonce
+    assert replayed["condition"] == result["condition"]
+    assert replayed["revealed_at"] == result["revealed_at"]
+
+    # 推进到周期 2：周期 2 的 nonce 此时才公开，且同样可校验
+    assert complete_period(client, eid, "s0", 1, "s0-c1").status_code == 200
+    second = reveal_period(client, eid, "s0", 2)
+    assert second.status_code == 200
+    second_body = second.json()
+    assert HEX32.match(second_body["nonce"])
+    assert second_body["allocation_slot_id"] == slot_id
+    assert second_body["nonce"] != nonce
+    expected_2 = recompute_commitment(
+        eid,
+        slot_id,
+        second_body["period"],
+        second_body["condition"],
+        second_body["nonce"],
+    )
+    assert expected_2 == commitments[(slot_id, 2)]
+
+
+def test_commitments_and_pre_reveal_endpoints_never_leak_nonce(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+
+    # 承诺接口不含任何 nonce / 条件字段
+    commitments_resp = get_commitments(client, eid).json()
+    assert "nonce" not in json.dumps(commitments_resp, ensure_ascii=False)
+    assert "condition" not in json.dumps(commitments_resp)
+
+    # 创建 / 详情 / 进度 / 揭盲失败路径同样不泄露 nonce
+    assert "nonce" not in json.dumps(body, ensure_ascii=False)
+    detail = client.get(f"/experiments/{eid}").json()
+    assert "nonce" not in json.dumps(detail, ensure_ascii=False)
+    progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert "nonce" not in json.dumps(progress, ensure_ascii=False)
+
+    # 周期不匹配的 409 响应不携带 nonce / 槽位 / 条件
+    conflict = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "bad"},
+    )
+    assert conflict.status_code == 409
+    text = conflict.text
+    assert "nonce" not in text
+    assert "allocation_slot_id" not in text
+
+    # 揭盲周期 1 后，周期 2 的 nonce 仍未公开：承诺接口依旧无 nonce，
+    # 进度接口只有周期 1 的条件，响应中也不出现周期 2 nonce
+    first = reveal_period(client, eid, "s1", 1).json()
+    commitments_after = get_commitments(client, eid).json()
+    assert "nonce" not in json.dumps(commitments_after, ensure_ascii=False)
+    progress_text = client.get(
+        f"/experiments/{eid}/subjects/s1/progress"
+    ).text
+    assert first["nonce"] not in progress_text
+
+
+def test_batch_advance_reveals_nonce_and_slot_and_replays(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+    commitments = {
+        (c["subject_id"], c["period"]): c
+        for c in get_commitments(client, eid).json()["commitments"]
+    }
+
+    resp = advance_batch(
+        client,
+        eid,
+        [
+            {"subject_id": "s2", "expected_period": 1},
+            {"subject_id": "s1", "expected_period": 1},
+        ],
+        "batch-commit-1",
+    )
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    nonces: dict[str, tuple[str, str]] = {}
+    for item in results:
+        slot_id = item["allocation_slot_id"]
+        nonce = item["nonce"]
+        assert HEX32.match(nonce)
+        entry = commitments[(item["subject_id"], 1)]
+        assert slot_id == entry["allocation_slot_id"]
+        assert (
+            recompute_commitment(
+                eid, slot_id, item["period"], item["condition"], nonce
+            )
+            == entry["commitment"]
+        )
+        nonces[item["subject_id"]] = (slot_id, nonce)
+
+    # 批量幂等重放返回同一槽位与 nonce
+    replay = advance_batch(
+        client,
+        eid,
+        [
+            {"subject_id": "s2", "expected_period": 1},
+            {"subject_id": "s1", "expected_period": 1},
+        ],
+        "batch-commit-1",
+    )
+    assert replay.status_code == 200
+    for item in replay.json()["results"]:
+        assert (item["allocation_slot_id"], item["nonce"]) == nonces[
+            item["subject_id"]
+        ]
+
+
+def test_replace_migrates_commitment_ownership_without_recompute(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+
+    before = get_commitments(client, eid).json()["commitments"]
+    s1_entries = [c for c in before if c["subject_id"] == "s1"]
+    s1_slot = s1_entries[0]["allocation_slot_id"]
+    assert all(c["allocation_slot_id"] == s1_slot for c in s1_entries)
+
+    assert replace_subject(client, eid, "s1", "s1-new", "rep-1").status_code == 200
+
+    after = get_commitments(client, eid).json()["commitments"]
+    # 承诺总数不变；原编号消失，新编号出现
+    assert len(after) == len(before)
+    assert all(c["subject_id"] != "s1" for c in after)
+    moved = [c for c in after if c["subject_id"] == "s1-new"]
+    assert len(moved) == 2
+    # 槽位归属迁移，但槽位 / 周期 / 承诺哈希与创建时完全一致（不重算）
+    by_period = {c["period"]: c for c in moved}
+    for old_entry in s1_entries:
+        new_entry = by_period[old_entry["period"]]
+        assert new_entry["allocation_slot_id"] == s1_slot
+        assert new_entry["commitment"] == old_entry["commitment"]
+    # s2 槽位完全不受影响
+    s2_before = {c["period"]: c for c in before if c["subject_id"] == "s2"}
+    s2_after = {c["period"]: c for c in after if c["subject_id"] == "s2"}
+    assert s2_before == s2_after
+
+    # 新编号揭盲拿到的就是同一槽位 / nonce，且可通过承诺校验
+    revealed = reveal_period(client, eid, "s1-new", 1).json()
+    assert revealed["allocation_slot_id"] == s1_slot
+    entry = by_period[1]
+    assert (
+        recompute_commitment(
+            eid,
+            s1_slot,
+            revealed["period"],
+            revealed["condition"],
+            revealed["nonce"],
+        )
+        == entry["commitment"]
+    )
+
+    # 原编号仍遵守墓碑语义：推进 409，且响应不泄露 nonce / 条件
+    tombstone = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "dead"},
+    )
+    assert tombstone.status_code == 409
+    assert tombstone.json()["detail"]["reason"] == "subject_replaced"
+    assert "nonce" not in tombstone.text
+
+    # 未揭盲的 s2 也可换号：槽位与承诺迁移，依旧不重算
+    assert replace_subject(client, eid, "s2", "s2-new", "rep-3").status_code == 200
+    chained = get_commitments(client, eid).json()["commitments"]
+    s2_moved = [c for c in chained if c["subject_id"] == "s2-new"]
+    assert len(s2_moved) == 2
+    for c in s2_moved:
+        assert c["commitment"] == s2_before[c["period"]]["commitment"]
+
+
+def test_commitments_unknown_experiment_returns_404(client: TestClient) -> None:
+    resp = get_commitments(client, "no-such-experiment")
+    assert resp.status_code == 404
+
+
+def test_legacy_experiment_returns_409_commitments_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "legacy-commit.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    # 模拟承诺机制上线前的旧库：只有 experiments / assignments
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-commit",
+                '["A","B"]',
+                1,
+                2,
+                2,
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-commit", "s1", 0, '["A","B"]'),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-commit", "s2", 1, '["B","A"]'),
+        )
+
+    with TestClient(app) as migrated:
+        # 迁移只建表、不回填：旧实验不得事后伪造创建时承诺
+        resp = migrated.get("/experiments/legacy-commit/commitments")
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "commitments_unavailable"
+        assert detail["experiment_id"] == "legacy-commit"
+
+        # 旧实验仍可继续揭盲：只是没有 nonce / 槽位可校验（字段为 null）
+        advance = migrated.post(
+            "/experiments/legacy-commit/advance",
+            json={
+                "subject_id": "s1",
+                "expected_period": 1,
+                "request_id": "legacy-a1",
+            },
+        )
+        assert advance.status_code == 200
+        assert advance.json()["condition"] == "A"
+        assert advance.json()["nonce"] is None
+        assert advance.json()["allocation_slot_id"] is None
+
+        # 新实验有完整承诺，与旧实验互不影响
+        new_body, _ = create_experiment(migrated, conditions=["A", "B"],
+                                       subject_ids=["x1", "x2"])
+        new_commitments = migrated.get(
+            f"/experiments/{new_body['experiment_id']}/commitments"
+        )
+        assert new_commitments.status_code == 200
+        assert len(new_commitments.json()["commitments"]) == 4

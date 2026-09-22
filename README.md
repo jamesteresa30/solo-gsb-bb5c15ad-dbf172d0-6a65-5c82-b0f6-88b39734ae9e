@@ -144,6 +144,80 @@ JSON 快照**，之后的揭盲 / 完成 / 暂停均不影响已生成快照：
   不含任何条件内容），支持 `limit`（1～500，默认 100）与 `offset`；
 - 换号不是揭盲：不受实验暂停状态影响，也不改变实验状态版本。
 
+## 盲态分配承诺（allocation commitments）
+
+让审计方在**不提前获知任何条件**的情况下，验证每次揭盲确实是实验创建时
+确定的安排，服务端无法事后篡改：
+
+- **创建时即承诺**：`POST /experiments` 创建实验时，为每个**稳定分配槽位**
+  （`allocation_slot_id`，创建时生成的随机 ID）的每个周期生成一个
+  **至少 128 位的随机 nonce**（32 位十六进制字符），与
+  `experiment_id / allocation_slot_id / period / condition / nonce` 五要素
+  一起计算承诺哈希：
+
+  ```text
+  commitment = SHA-256(
+      键排序、紧凑分隔符（, 与 :）、UTF-8 编码的 JSON 对象
+      {"allocation_slot_id","condition","experiment_id","nonce","period"}
+  )
+  ```
+
+  nonce 与完整条件一样**只保存在服务端**；nonce 用密码学随机源生成，
+  **不由随机种子推导**（种子是创建接口的公开输入）；
+- **承诺查询不含 nonce** `GET /experiments/{id}/commitments`：随时可拉取
+  全部槽位 / 周期的承诺，但每条只含**当前受试者、槽位、周期与
+  commitment**，不含 nonce、不含条件——未揭盲项无法被猜测或提前验证；
+- **揭盲时才公开 nonce**：单条推进与批量推进**成功时**（以及相同幂等键的
+  **重放**）在响应中返回该次揭盲对应的 `allocation_slot_id` 与 `nonce`。
+  审计方拿到 `(槽位, 周期, 条件, nonce)` 后按上面的同一规则重算 SHA-256，
+  与创建时承诺一致即证明“揭盲结果就是创建时锁死的安排”。未揭盲周期的
+  nonce 不会出现在任何接口响应中；
+- **换号只迁移槽位归属**：受试者换号时，槽位的当前归属（`subject_id`）
+  原子改挂到新编号，`allocation_slot_id / period / condition / nonce /
+  commitment` **全部保持创建时原值，承诺不重算**；原编号仍遵守墓碑语义
+  （承诺接口中不再出现原编号，对原编号推进 / 查询仍为 `409 subject_replaced`）；
+- **旧实验不伪造承诺**：启动迁移**只新建承诺表**（`CREATE TABLE IF
+  NOT EXISTS`），不为历史实验回填承诺。对承诺机制上线前创建的旧实验调用
+  承诺接口返回 `409 commitments_unavailable`；旧实验仍可正常揭盲，
+  其揭盲响应中的 `nonce` / `allocation_slot_id` 为 `null`。
+
+### 校验示例（Python）
+
+```python
+import hashlib, json, requests
+
+BASE = "http://localhost:8000"
+eid = "<experiment_id>"
+
+# 1) 揭盲前：拉取承诺（只含哈希，不含 nonce / 条件）
+commitments = requests.get(f"{BASE}/experiments/{eid}/commitments").json()["commitments"]
+by_key = {(c["allocation_slot_id"], c["period"]): c["commitment"] for c in commitments}
+
+# 2) 揭盲某受试者的下一周期：成功响应才携带该槽位 / 周期的 nonce
+revealed = requests.post(
+    f"{BASE}/experiments/{eid}/advance",
+    json={"subject_id": "s1", "expected_period": 1, "request_id": "req-1"},
+).json()
+
+# 3) 按与服务端相同的规范化规则重算并比对
+payload = {
+    "experiment_id": eid,
+    "allocation_slot_id": revealed["allocation_slot_id"],
+    "period": revealed["period"],
+    "condition": revealed["condition"],
+    "nonce": revealed["nonce"],
+}
+canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"))
+digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+assert digest == by_key[(revealed["allocation_slot_id"], revealed["period"])]
+print("揭盲结果与创建时承诺一致")
+
+# 幂等重放返回同一 nonce / 槽位，可反复核对；
+# 换号后槽位 ID 与承诺哈希不变，只是受试者归属迁移到新编号。
+```
+
 ## 快速启动（Docker Compose，一条命令）
 
 ```bash
@@ -153,8 +227,9 @@ docker compose up --build
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
 启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换、
-紧急揭盲幂等、紧急揭盲审计、结果快照与受试者换号表通过 `CREATE TABLE IF NOT EXISTS`
-自动补齐，
+紧急揭盲幂等、紧急揭盲审计、结果快照、受试者换号与盲态分配承诺表通过
+`CREATE TABLE IF NOT EXISTS` 自动补齐（承诺表只建表、**不回填**，旧实验查询承诺
+返回 `409 commitments_unavailable`），
 `experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
 `ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
 状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停与恢复、紧急揭盲。
@@ -275,7 +350,9 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance \
 ```
 
 仅当 `expected_period` 等于该受试者下一周期、**上一周期已登记完成且洗脱期已届满**
-时返回 `200`，并把进度原子推进到下一周期：
+时返回 `200`，并把进度原子推进到下一周期；响应同时返回该槽位 / 周期的盲态承诺
+要素 `allocation_slot_id` 与 `nonce`（供承诺校验，详见“盲态分配承诺”一节；
+承诺机制上线前的旧实验为 `null`）：
 
 ```json
 {
@@ -284,7 +361,9 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance \
   "period": 1,
   "condition": "A",
   "request_id": "9f1c…",
-  "revealed_at": "2026-09-21T08:00:00.000000+00:00"
+  "revealed_at": "2026-09-21T08:00:00.000000+00:00",
+  "allocation_slot_id": "a3f0…（32 位十六进制）",
+  "nonce": "7b2e…（32 位十六进制，即 128 位随机 nonce）"
 }
 ```
 
@@ -305,7 +384,8 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance \
 要么完成先落盘后放行，要么推进看到“未完成 / 未到期”而 `409`，不会出现绕过门禁的揭盲。
 门禁失败（409）不写入幂等记录、不消耗 `request_id`，到期后用同一 `request_id` 重试即可首次成功。
 
-幂等语义：相同 `(实验, request_id)` 且相同请求体重试，返回**首次的条件与 `revealed_at`**，
+幂等语义：相同 `(实验, request_id)` 且相同请求体重试，返回**首次的条件与 `revealed_at`**
+（以及首次对应的 `allocation_slot_id` 与 `nonce`），
 即使此时受试者已经推进到更后面的周期，也不会重复推进或改写历史。
 
 ### 批量受控揭盲 `POST /experiments/{experiment_id}/advance-batch`
@@ -363,9 +443,11 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance-batch \
   "batch_id": "b7c1…",
   "results": [
     {"experiment_id": "…", "subject_id": "s1", "period": 1, "condition": "A",
-     "request_id": "batch:b7c1…:s1:1", "revealed_at": "…"},
+     "request_id": "batch:b7c1…:s1:1", "revealed_at": "…",
+     "allocation_slot_id": "a3f0…", "nonce": "7b2e…"},
     {"experiment_id": "…", "subject_id": "s2", "period": 1, "condition": "B",
-     "request_id": "batch:b7c1…:s2:1", "revealed_at": "…"}
+     "request_id": "batch:b7c1…:s2:1", "revealed_at": "…",
+     "allocation_slot_id": "c58d…", "nonce": "e104…"}
   ]
 }
 ```
@@ -839,6 +921,46 @@ curl 'http://localhost:8000/experiments/<experiment_id>/subject-replacements?lim
 - 审计记录只增不改；从未换号的实验返回 `replacements: []`；
 - 实验不存在返回 `404`。
 
+### 查询盲态分配承诺 `GET /experiments/{experiment_id}/commitments`
+
+返回实验全部稳定分配槽位 / 周期的创建时承诺，**只含当前受试者、槽位、周期与
+承诺哈希**（不含 nonce、不含条件），按 `subject_id`、`period` 稳定排序：
+
+```bash
+curl http://localhost:8000/experiments/<experiment_id>/commitments
+```
+
+```json
+{
+  "experiment_id": "…",
+  "commitments": [
+    {"subject_id": "s1", "allocation_slot_id": "a3f0…", "period": 1,
+     "commitment": "9f86…（64 位十六进制 SHA-256）"},
+    {"subject_id": "s1", "allocation_slot_id": "a3f0…", "period": 2,
+     "commitment": "1bd4…"},
+    {"subject_id": "s2", "allocation_slot_id": "c58d…", "period": 1,
+     "commitment": "55ac…"}
+  ]
+}
+```
+
+- 每个受试者对应唯一 `allocation_slot_id`；换号后槽位不变，只把条目中的
+  `subject_id` 归属改挂到新编号（`commitment` 保持创建时原值）；
+- nonce 只通过成功推进 / 批量推进（含幂等重放）的响应公开，拿到后按
+  “盲态分配承诺”一节的规则重算 SHA-256 即可与本接口的 `commitment` 核对；
+- 实验不存在返回 `404`；承诺机制上线前创建的旧实验没有创建时承诺，
+  返回 `409`：
+
+```json
+{
+  "detail": {
+    "message": "该实验创建于分配承诺机制上线前，不存在创建时承诺",
+    "reason": "commitments_unavailable",
+    "experiment_id": "…"
+  }
+}
+```
+
 ### 其他接口
 
 - `GET /experiments/{experiment_id}`：查询实验（受试者名册 + 条件清单 +
@@ -850,7 +972,7 @@ curl 'http://localhost:8000/experiments/<experiment_id>/subject-replacements?lim
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、盲态分配承诺、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -861,7 +983,7 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共十四张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十五张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
@@ -890,6 +1012,11 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
     每行记录原编号（退役墓碑）、新编号、`operation_id`、原因与时间，
     按 `(实验, operation_id)` 唯一约束支持幂等重放，按自增 `id` 时间倒序
     分页查询；只含编号 / 原因 / 时间等元数据，**不含任何条件内容**。
+  - `allocation_commitments`：盲态分配承诺，每个稳定分配槽位
+    （`allocation_slot_id`，创建时随机生成）× 每个周期一行，保存创建时的
+    ≥128 位随机 `nonce`、条件与承诺哈希，以及槽位当前归属
+    `subject_id`；迁移**只建表不回填**，旧实验无承诺行（承诺接口
+    `409 commitments_unavailable`）。
 - **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
   “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
   恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，
@@ -939,3 +1066,16 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   `operation_id`。墓碑检查同样内嵌在单条 / 批量推进、完成登记、进度查询与
   紧急揭盲的写事务（或查询）中，退役编号的一切后续操作一律
   `409 subject_replaced`，不会泄露任何条件内容。
+- **盲态承诺的绑定、公开与换号迁移**：承诺与实验、隐藏分配在**同一创建事务**
+  内原子落盘，nonce 取自 `secrets`（不由公开种子推导）；承诺只可通过
+  `GET /experiments/{id}/commitments` 读到哈希，nonce 仅在揭盲写事务确定
+  `condition` 后随首次结果返回，单条推进的幂等重放按
+  `(实验, subject_id, period)` 回查同一承诺行，批量结果则把 nonce / 槽位
+  固化进 `advance_batches.results` 随首次结果重放。由于换号的前置条件是
+  “从未揭盲”，任何已产生揭盲记录的编号都不可能再迁移槽位，因此重放回查的
+  槽位 / nonce 与首次严格一致。换号事务额外执行一次
+  `UPDATE allocation_commitments SET subject_id = …`：只迁移槽位归属，
+  `allocation_slot_id` / `nonce` / `commitment` 一律不重算，审计链跨过
+  换号仍然连续。迁移只 `CREATE TABLE IF NOT EXISTS`：旧实验没有承诺行，
+  承诺接口返回 `409 commitments_unavailable`，旧实验揭盲响应的 nonce /
+  槽位为 `null`，绝不事后伪造创建时承诺。

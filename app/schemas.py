@@ -81,6 +81,10 @@ class AdvanceOut(BaseModel):
     condition: str
     request_id: str
     revealed_at: str
+    # 盲态分配承诺：仅成功揭盲（含幂等重放）后公开的稳定槽位与 nonce，
+    # 审计方可据此重算承诺哈希。承诺机制上线前的旧实验无承诺，为 null。
+    allocation_slot_id: str | None = None
+    nonce: str | None = None
 
 
 class AdvanceBatchMember(BaseModel):
@@ -467,3 +471,23 @@ class SubjectReplacementEventsOut(BaseModel):
 
     experiment_id: str
     replacements: list[SubjectReplacementEventOut]
+
+
+class CommitmentOut(BaseModel):
+    """一条盲态分配承诺。
+
+    只包含槽位当前归属的受试者、稳定槽位、周期与承诺哈希；
+    **不包含 nonce 与条件**——nonce 仅在该周期成功揭盲后随揭盲结果返回。
+    """
+
+    subject_id: str
+    allocation_slot_id: str
+    period: int
+    commitment: str
+
+
+class CommitmentsOut(BaseModel):
+    """实验全部稳定分配槽位 / 周期的盲态承诺列表。"""
+
+    experiment_id: str
+    commitments: list[CommitmentOut]

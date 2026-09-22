@@ -46,6 +46,16 @@
   换号在单个 ``BEGIN IMMEDIATE`` 事务内把 ``assignments`` 的隐藏分配
   （序列内容及下标不变）与 ``subject_progress`` 进度原子改挂到新编号，
   仅允许原编号从未发生过任何揭盲（按周期揭盲或完成紧急揭盲）时操作。
+* ``allocation_commitments``：盲态分配承诺。创建实验时为每个稳定分配槽位
+  （``allocation_slot_id``，创建时生成的随机 ID，换号不变）的每个周期生成
+  至少 128 位随机 ``nonce``，并保存
+  ``SHA-256(规范化 JSON[experiment_id, allocation_slot_id, period,
+  condition, nonce])`` 承诺哈希；``subject_id`` 记录槽位当前归属
+  （换号时仅迁移归属，承诺与 nonce 不重算）。``nonce`` 与 ``condition``
+  只保存在服务端：查询接口只下发槽位 / 周期 / 承诺，``nonce`` 仅在对应
+  周期成功揭盲（含幂等重放）时随揭盲结果返回。迁移只建表不回填：
+  承诺机制上线前创建的旧实验没有创建时承诺，查询返回
+  ``409 commitments_unavailable``，绝不事后伪造。
 """
 
 from __future__ import annotations
@@ -66,6 +76,9 @@ BUSY_TIMEOUT_MS = 10_000
 
 # 紧急揭盲授权窗口：首个审批人开启后，第二个不同审批人必须在窗口内批准
 EMERGENCY_UNBLIND_WINDOW_SECONDS = 15 * 60
+
+# 每个稳定分配槽位 / 周期的 nonce 随机字节数（128 位）
+COMMITMENT_NONCE_BYTES = 16
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (
@@ -214,6 +227,18 @@ CREATE TABLE IF NOT EXISTS subject_replacements (
     created_at              TEXT NOT NULL,
     UNIQUE (experiment_id, operation_id),
     UNIQUE (experiment_id, original_subject_id)
+);
+
+CREATE TABLE IF NOT EXISTS allocation_commitments (
+    experiment_id      TEXT NOT NULL REFERENCES experiments(id),
+    allocation_slot_id TEXT NOT NULL,   -- 稳定分配槽位（创建时生成，换号不变）
+    subject_id         TEXT NOT NULL,   -- 槽位当前归属的受试者（换号时迁移）
+    period             INTEGER NOT NULL,
+    condition          TEXT NOT NULL,   -- 创建时确定的条件（仅服务端持有）
+    nonce              TEXT NOT NULL,   -- ≥128 位随机 nonce（揭盲前不下发）
+    commitment         TEXT NOT NULL,   -- SHA-256(规范化 JSON) hex
+    created_at         TEXT NOT NULL,
+    PRIMARY KEY (experiment_id, allocation_slot_id, period)
 );
 """
 
@@ -401,6 +426,33 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def compute_commitment(
+    experiment_id: str,
+    allocation_slot_id: str,
+    period: int,
+    condition: str,
+    nonce: str,
+) -> str:
+    """计算盲态分配承诺哈希。
+
+    对 ``[experiment_id, allocation_slot_id, period, condition, nonce]``
+    五要素的 JSON 对象做**键排序、紧凑分隔符、UTF-8** 规范化编码后取
+    SHA-256（hex）。审计方可在揭盲后用返回的 ``nonce`` 与槽位按同一规则
+    重算，核对该次揭盲确实是创建时确定的安排。
+    """
+    payload = {
+        "experiment_id": experiment_id,
+        "allocation_slot_id": allocation_slot_id,
+        "period": period,
+        "condition": condition,
+        "nonce": nonce,
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _database_path() -> str:
     return os.environ.get("DATABASE_PATH", "experiments.db")
 
@@ -457,6 +509,7 @@ def insert_experiment(
     created_at: str,
     assignments: list[dict[str, Any]],
     washout_seconds: int = 0,
+    commitments: list[dict[str, Any]] | None = None,
 ) -> None:
     with closing(get_connection()) as conn:
         with conn:
@@ -489,6 +542,27 @@ def insert_experiment(
                     for a in assignments
                 ],
             )
+            if commitments:
+                # 盲态分配承诺与实验创建在同一事务内原子落盘
+                conn.executemany(
+                    "INSERT INTO allocation_commitments "
+                    "(experiment_id, allocation_slot_id, subject_id, period, "
+                    "condition, nonce, commitment, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            experiment_id,
+                            c["allocation_slot_id"],
+                            c["subject_id"],
+                            c["period"],
+                            c["condition"],
+                            c["nonce"],
+                            c["commitment"],
+                            created_at,
+                        )
+                        for c in commitments
+                    ],
+                )
 
 
 def advance_period(
@@ -584,6 +658,29 @@ def _is_tombstoned(
     return row is not None
 
 
+def _get_commitment_nonce(
+    conn: sqlite3.Connection, experiment_id: str, subject_id: str, period: int
+) -> tuple[str | None, str | None]:
+    """读取某受试者当前槽位在指定周期的 ``(槽位 ID, nonce)``。
+
+    揭盲成功（含幂等重放）后随结果返回。承诺机制上线前创建的旧实验没有
+    承诺记录，返回 ``(None, None)``——旧实验可继续揭盲，但无 nonce / 槽位
+    可校验，承诺查询接口对其返回 ``409 commitments_unavailable``。
+
+    槽位归属只在换号时迁移，而换号要求原受试者从未揭盲，因此任何已有
+    揭盲记录（含幂等记录）的受试者其 ``(subject_id, period)`` → 槽位
+    映射此后不会再变，重放路径按当前归属查询与首次结果一致。
+    """
+    row = conn.execute(
+        "SELECT allocation_slot_id, nonce FROM allocation_commitments "
+        "WHERE experiment_id = ? AND subject_id = ? AND period = ?",
+        (experiment_id, subject_id, period),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["allocation_slot_id"], row["nonce"]
+
+
 def _advance_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -603,6 +700,11 @@ def _advance_locked(
             or request_row["expected_period"] != expected_period
         ):
             raise RequestIdConflictError()
+        # 幂等重放：返回首次结果，并附带首次揭盲周期对应的槽位与 nonce
+        # （映射此后不会变化，详见 _get_commitment_nonce 的说明）
+        slot_id, nonce = _get_commitment_nonce(
+            conn, experiment_id, subject_id, request_row["period"]
+        )
         return {
             "experiment_id": experiment_id,
             "subject_id": subject_id,
@@ -610,6 +712,8 @@ def _advance_locked(
             "condition": request_row["condition"],
             "request_id": request_id,
             "revealed_at": request_row["revealed_at"],
+            "allocation_slot_id": slot_id,
+            "nonce": nonce,
             "_replayed": True,
         }
 
@@ -672,6 +776,10 @@ def _advance_locked(
         revealed_at = utc_now().isoformat()
 
     condition = sequence[next_period - 1]
+    # 揭盲才公开该槽位 / 周期的 nonce；未揭盲周期的 nonce 一律不离开服务端
+    slot_id, nonce = _get_commitment_nonce(
+        conn, experiment_id, subject_id, next_period
+    )
 
     conn.execute(
         "INSERT INTO unblindings "
@@ -717,6 +825,8 @@ def _advance_locked(
         "condition": condition,
         "request_id": request_id,
         "revealed_at": revealed_at,
+        "allocation_slot_id": slot_id,
+        "nonce": nonce,
         "_replayed": False,
     }
 
@@ -932,6 +1042,10 @@ def _advance_batch_locked(
         # 与单条推进的 request_id 空间互不干扰
         derived_request_id = f"batch:{batch_id}:{subject_id}:{period}"
         revealed_at = utc_now().isoformat()
+        # 揭盲才公开该槽位 / 周期的 nonce；随首次结果落盘，重放原样返回
+        slot_id, nonce = _get_commitment_nonce(
+            conn, experiment_id, subject_id, period
+        )
 
         conn.execute(
             "INSERT INTO unblindings "
@@ -962,6 +1076,8 @@ def _advance_batch_locked(
                 "condition": condition,
                 "request_id": derived_request_id,
                 "revealed_at": revealed_at,
+                "allocation_slot_id": slot_id,
+                "nonce": nonce,
             }
         )
 
@@ -2185,6 +2301,13 @@ def _replace_subject_locked(
         "WHERE experiment_id = ? AND subject_id = ?",
         (replacement_subject_id, experiment_id, subject_id),
     )
+    # 盲态承诺只迁移槽位归属：allocation_slot_id / period / condition /
+    # nonce / commitment 全部保持创建时原值，承诺不重算
+    conn.execute(
+        "UPDATE allocation_commitments SET subject_id = ? "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (replacement_subject_id, experiment_id, subject_id),
+    )
 
     # 7) 同事务落墓碑与审计（同一张表）：原编号自此退役
     created_at = utc_now().isoformat()
@@ -2356,6 +2479,40 @@ def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:
             for row in reveal_rows
         ],
     }
+
+
+def get_commitments(experiment_id: str) -> list[dict[str, Any]] | None:
+    """查询实验的盲态分配承诺（只含当前受试者、槽位、周期与承诺哈希）。
+
+    返回的每条承诺只含 ``subject_id``（槽位当前归属）、
+    ``allocation_slot_id``、``period`` 与 ``commitment``，**绝不包含
+    ``nonce`` 或条件**——nonce 仅在对应周期成功揭盲时随揭盲结果返回。
+
+    实验不存在时返回 ``None``（404）；实验存在但没有任何承诺记录
+    （承诺机制上线前创建的旧实验）时返回空列表，由接口层转换为
+    ``409 commitments_unavailable``，绝不事后回填伪造创建时承诺。
+    """
+    with closing(get_connection()) as conn:
+        experiment_row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if experiment_row is None:
+            return None
+        rows = conn.execute(
+            "SELECT subject_id, allocation_slot_id, period, commitment "
+            "FROM allocation_commitments WHERE experiment_id = ? "
+            "ORDER BY subject_id, period",
+            (experiment_id,),
+        ).fetchall()
+    return [
+        {
+            "subject_id": row["subject_id"],
+            "allocation_slot_id": row["allocation_slot_id"],
+            "period": row["period"],
+            "commitment": row["commitment"],
+        }
+        for row in rows
+    ]
 
 
 def get_experiment(experiment_id: str) -> dict[str, Any] | None:
